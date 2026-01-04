@@ -12,12 +12,25 @@
 ├── data/                                    # 本地数据集
 │   └── Loc-Bench_V1_dataset.jsonl          # Loc-Bench 数据集（560条）
 ├── index_data/Loc-Bench_V1/
-│   ├── graph_index_v2.3/                   # 图索引 (*.pkl)
-│   └── BM25_index/                         # BM25 索引
+│   ├── graph_index_v2.3/                   # 图索引 (*.pkl) - LocAgent 使用
+│   ├── BM25_index/                         # BM25 索引 - LocAgent/BM25 基线使用
+│   └── rlcoder_index/                      # RLCoder 索引 - RLCoder 使用
+│       ├── repo_name/
+│       │   ├── codeblocks.pkl
+│       │   ├── bm25_index.pkl
+│       │   └── meta.pkl
+│       └── ...
+├── method/                                  # 方法评测框架
+│   ├── base.py                             # 基类定义
+│   ├── utils.py                            # 共享工具
+│   ├── bm25/                               # BM25 基线
+│   └── RLCoder/                            # RLCoder 检索框架
 ├── playground/locbench_repos/              # 克隆的仓库
 ├── outputs/                                # 实验输出
 │   ├── bm25_locbench/                      # BM25 基线结果
-│   └── locagent_*/                         # LocAgent 结果
+│   ├── locagent_*/                         # LocAgent 结果
+│   └── rlcoder_*/                          # RLCoder 结果
+│       └── loc_outputs.jsonl               # 标准定位输出
 └── run_locagent.sh                         # LocAgent 启动脚本
 ```
 
@@ -456,7 +469,397 @@ outputs/locagent_<timestamp>/
 - **`merged_loc_outputs_mrr.jsonl`**：合并后的结果，`found_files` 格式为 `[file1, file2, ...]`（单个列表）
 - **评估时必须使用 `merged_loc_outputs_mrr.jsonl`**，否则评估结果会出错或全为 0
 
-## 运行 BM25 基线
+## 方法评测框架（method/）
+
+统一的方法评测框架，支持检索类、生成类、智能体类等多种算法，输出标准化的 `loc_outputs.jsonl`。
+
+### 目录结构
+
+```
+method/
+├── __init__.py
+├── base.py                      # 基类定义（LocResult, BaseMethod）
+├── utils.py                     # 共享工具（数据加载、索引加载等）
+├── bm25/                        # BM25 基线
+│   ├── run.py                   # CLI 入口
+│   └── retriever.py             # 检索逻辑
+├── RLCoder/                     # RLCoder 检索增强框架
+│   ├── build_index.py           # 索引构建脚本（LocBench 适配）
+│   ├── run_locbench.py          # LocBench 评测脚本（LocBench 适配）
+│   ├── locbench_adapter.py      # LocBench 工具函数
+│   ├── requirements.txt         # 依赖（含 rank_bm25）
+│   │
+│   ├── main.py                  # 原始训练/评测入口（原始 RLCoder）
+│   ├── bm25.py                  # 任务级 BM25 索引（原始 RLCoder）
+│   ├── retriever.py             # 神经检索器 (UniXcoder)（原始 RLCoder）
+│   ├── generator.py             # 代码生成器（原始 RLCoder）
+│   ├── datasets.py              # 数据格式 (Example, CodeBlock)（原始 RLCoder）
+│   └── utils/                   # 工具函数（原始 RLCoder）
+└── locagent/                    # LocAgent（可选）
+    └── run.py
+```
+
+### 标准输出格式
+
+每个方法输出 `loc_outputs.jsonl`，每行一个 JSON 对象：
+
+```json
+{
+  "instance_id": "repo__project-123",
+  "found_files": ["src/utils.py", "src/main.py"],
+  "found_modules": ["src/utils.py:MyClass", "src/main.py:helper"],
+  "found_entities": ["src/utils.py:MyClass.method", "src/main.py:helper"],
+  "raw_output_loc": []
+}
+```
+
+### 运行 BM25 基线（新框架）
+
+```bash
+cd /workspace/LocAgent
+export PYTHONPATH=$PYTHONPATH:$(pwd)
+
+# 在线模式
+python method/bm25/run.py \
+  --dataset czlll/Loc-Bench_V1 \
+  --split test \
+  --output_folder outputs/bm25_results \
+  --graph_index_dir index_data/Loc-Bench_V1/graph_index_v2.3 \
+  --bm25_index_dir index_data/Loc-Bench_V1/BM25_index
+
+# 离线模式
+python method/bm25/run.py \
+  --dataset_path data/Loc-Bench_V1_dataset.jsonl \
+  --output_folder outputs/bm25_results \
+  --graph_index_dir index_data/Loc-Bench_V1/graph_index_v2.3 \
+  --bm25_index_dir index_data/Loc-Bench_V1/BM25_index
+```
+
+### RLCoder 方法详解
+
+#### 背景与设计思路
+
+RLCoder 原本是代码补全的检索增强框架（ICSE 2025），我们将其适配为代码定位任务。**核心差异**在于索引机制：
+
+| 特性 | LocAgent | RLCoder |
+|------|----------|---------|
+| **索引粒度** | 仓库级（整个 repo 一个索引） | 仓库级（每个 repo 独立索引） |
+| **索引构建时机** | 预构建（离线） | 预构建（离线） |
+| **索引内容** | 图结构 + BM25 | BM25（代码块级别） |
+| **代码切分方式** | 基于 AST 的节点 | Mini blocks（~15行）或 Fixed blocks（12行） |
+| **检索方式** | 图遍历 + BM25 | BM25 → UniXcoder（可选） |
+| **原始任务** | 代码定位 | 代码补全（适配为定位） |
+
+#### 索引构建机制
+
+RLCoder 索引构建流程：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    RLCoder 索引构建流程                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  playground/locbench_repos/          build_index.py            │
+│  ├── pandas-dev_pandas/      ──→    1. 扫描仓库                │
+│  │   ├── pandas/                    2. 加载 .py 文件            │
+│  │   ├── setup.py                   3. 切分为代码块              │
+│  │   └── ...                        4. 构建 BM25 索引           │
+│  └── ...                            5. 保存索引                 │
+│                                      ↓                           │
+│                            index_data/.../rlcoder_index/        │
+│                            ├── pandas-dev_pandas/               │
+│                            │   ├── codeblocks.pkl               │
+│                            │   ├── bm25_index.pkl               │
+│                            │   └── meta.pkl                     │
+│                            └── ...                              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**代码切分策略**：
+
+1. **Mini Block 模式**（默认）：
+   - 按空行分割代码
+   - 每块最多 15 行
+   - 小块会合并，大块会拆分
+   - 示例：一个 100 行的文件 → ~7 个代码块
+
+2. **Fixed Block 模式**（`--enable_fixed_block`）：
+   - 固定每 12 行一块
+   - 适合需要固定大小块的场景
+
+**为什么索引构建这么快？**
+
+- 纯 CPU 操作（无神经网络）
+- 简单数据结构（字典 + 列表）
+- 时间复杂度：O(n·m)，n=文档数，m=词汇量
+- 典型仓库（500-2000 文件）构建时间：1-5 秒
+
+**索引统计示例**：
+```
+pandas-dev_pandas:
+  - 文件数: ~500 个 .py 文件
+  - 代码块数: ~5000 个 blocks
+  - 索引大小: ~10MB
+
+home-assistant_core:
+  - 文件数: ~1800 个 .py 文件
+  - 代码块数: ~21000 个 blocks
+  - 索引大小: ~25MB
+```
+
+#### 检索与定位流程
+
+**BM25 检索模式**（不需要 GPU）：
+```
+问题描述 → BM25 检索 → Top-K 代码块 → 提取文件/模块/实体 → 输出
+```
+
+**神经检索模式**（需要 GPU）：
+```
+问题描述 → BM25 初筛（Top-50） → UniXcoder 重排序（Top-20） → 提取 → 输出
+```
+
+**定位信息提取**：
+- **文件**：从代码块的 `file_path` 直接提取 ✅
+- **模块**：从代码块中用正则提取类名 ⚠️（准确率低）
+- **实体**：从代码块中用正则提取函数名 ⚠️（准确率低）
+
+#### 性能分析
+
+**实测结果**（BM25 模式，560 条测试集）：
+
+| 指标 | File | Module | Function |
+|------|------|--------|----------|
+| Acc@1 | 16.43% | - | - |
+| Acc@3 | 21.25% | - | - |
+| Acc@5 | 26.43% | 0.89% | 1.25% |
+| Acc@10 | - | 0.89% | 1.43% |
+
+**分析**：
+- ✅ **File 级别有效**：16.43% vs 随机猜测 1-5%（假设平均 50-100 个文件）
+- ❌ **Module/Function 级别接近随机**：提取逻辑过于简单，仅从检索到的代码块用正则提取
+
+**原因**：
+1. 只从检索到的代码块提取，如果代码块不包含目标类/函数就提取不到
+2. 正则表达式过于简单，无法处理嵌套类、装饰器等复杂情况
+3. 应该使用图索引或 AST 解析来提取所有实体
+
+#### 已知问题与改进方向
+
+1. **Module/Function 提取不准确**
+   - 当前：简单正则表达式从代码块提取
+   - 改进：使用图索引（如 LocAgent）或 AST 解析器提取所有实体
+
+2. **未利用代码结构信息**
+   - 当前：纯 BM25 文本匹配
+   - 改进：结合图结构、调用关系等语义信息
+
+3. **检索范围限制**
+   - 当前：仅从检索到的代码块提取
+   - 改进：检索到文件后，从整个文件提取所有实体
+
+### 运行 RLCoder（三阶段流程）
+
+RLCoder 评测遵循标准三阶段流程：**建索引 → 跑评测 → 评估结果**
+
+> **依赖**：需要安装 `rank_bm25`，如未安装请运行：`pip install rank_bm25`
+
+#### 阶段 1：构建索引
+
+为 `locbench_repos` 中的每个仓库构建 RLCoder 专用的 BM25 索引：
+
+```bash
+cd /workspace/LocAgent
+export PYTHONPATH=$PYTHONPATH:$(pwd)
+
+# 快速测试（只处理 3 个仓库验证流程）
+python method/RLCoder/build_index.py \
+  --repo_base_dir playground/locbench_repos \
+  --output_dir index_data/Loc-Bench_V1/rlcoder_index \
+  --num_processes 1 \
+  --limit 3
+
+# 完整构建（多进程，根据 CPU 核数调整）
+python method/RLCoder/build_index.py \
+  --repo_base_dir playground/locbench_repos \
+  --output_dir index_data/Loc-Bench_V1/rlcoder_index \
+  --num_processes 8
+```
+
+索引输出结构：
+```
+index_data/Loc-Bench_V1/rlcoder_index/
+├── pandas-dev_pandas/
+│   ├── codeblocks.pkl    # List[CodeBlock] - 所有代码块
+│   ├── bm25_index.pkl    # BM25Okapi - BM25 倒排索引
+│   └── meta.pkl          # Dict - 元信息（文件数、块数等）
+├── home-assistant_core/
+│   └── ...
+└── ...
+```
+
+**索引文件说明**：
+- `codeblocks.pkl`：包含所有代码块，每个代码块包含 `file_path`、`code_content`、`start_line`、`end_line` 等信息
+- `bm25_index.pkl`：BM25 倒排索引，用于快速检索相关代码块
+- `meta.pkl`：包含 `num_files`、`num_blocks`、`language` 等统计信息
+
+检查索引：
+```bash
+# 查看已构建的仓库数量
+ls index_data/Loc-Bench_V1/rlcoder_index/ | wc -l
+
+# 查看单个仓库的索引大小
+du -sh index_data/Loc-Bench_V1/rlcoder_index/*/
+
+# 查看索引元信息（Python）
+python -c "
+import pickle
+import os
+repo_name = 'pandas-dev_pandas'
+meta_path = f'index_data/Loc-Bench_V1/rlcoder_index/{repo_name}/meta.pkl'
+with open(meta_path, 'rb') as f:
+    meta = pickle.load(f)
+print(meta)
+"
+```
+
+#### 阶段 2：运行评测
+
+加载预构建的索引进行检索：
+
+```bash
+# 快速测试（在线模式，仅 5 条）
+python method/RLCoder/run_locbench.py \
+  --dataset czlll/Loc-Bench_V1 \
+  --split test \
+  --index_dir index_data/Loc-Bench_V1/rlcoder_index \
+  --output_folder outputs/rlcoder_test \
+  --inference_type bm25 \
+  --eval_n_limit 5
+
+# 完整评测 - BM25 检索（不需要 GPU）
+python method/RLCoder/run_locbench.py \
+  --dataset czlll/Loc-Bench_V1 \
+  --split test \
+  --index_dir index_data/Loc-Bench_V1/rlcoder_index \
+  --output_folder outputs/rlcoder_bm25 \
+  --inference_type bm25
+
+# 离线模式（需要先导出数据集）
+python method/RLCoder/run_locbench.py \
+  --dataset_path data/Loc-Bench_V1_dataset.jsonl \
+  --index_dir index_data/Loc-Bench_V1/rlcoder_index \
+  --output_folder outputs/rlcoder_bm25 \
+  --inference_type bm25
+
+# UniXcoder 神经检索（需要 GPU）
+python method/RLCoder/run_locbench.py \
+  --dataset czlll/Loc-Bench_V1 \
+  --index_dir index_data/Loc-Bench_V1/rlcoder_index \
+  --output_folder outputs/rlcoder_neural \
+  --inference_type unixcoder \
+  --retriever_model_path microsoft/unixcoder-base
+
+# 使用训练好的 RLRetriever（需要 GPU + 下载模型）
+python method/RLCoder/run_locbench.py \
+  --dataset czlll/Loc-Bench_V1 \
+  --index_dir index_data/Loc-Bench_V1/rlcoder_index \
+  --output_folder outputs/rlcoder_rl \
+  --inference_type unixcoder_with_rl \
+  --retriever_model_path nov3630/RLRetriever
+```
+
+#### 阶段 3：评估结果
+
+```bash
+python evaluation/eval_metric.py \
+  --gt_file data/Loc-Bench_V1_dataset.jsonl \
+  --output_file outputs/rlcoder_bm25/loc_outputs.jsonl
+
+# 或使用在线数据集（需要网络）
+python -c "
+from datasets import load_dataset
+from evaluation.eval_metric import evaluate_results
+ds = load_dataset('czlll/Loc-Bench_V1', split='test')
+evaluate_results('outputs/rlcoder_bm25/loc_outputs.jsonl', list(ds))
+"
+```
+
+**RLCoder 索引特点总结**：
+
+1. **代码块切分**：
+   - Mini blocks（默认）：按空行分割，每块最多 15 行
+   - Fixed blocks（可选）：固定每 12 行一块
+   - 适合代码补全任务，但用于定位任务时需要改进提取逻辑
+
+2. **索引结构**：
+   - 为每个仓库构建独立的 BM25 索引
+   - 索引文件较小：单个大型仓库约 10-30MB
+   - 构建速度快：纯 CPU 操作，无神经网络计算
+
+3. **检索方式**：
+   - BM25 检索（不需要 GPU）：直接使用 BM25 文本匹配
+   - BM25 + UniXcoder（需要 GPU）：BM25 初筛 → 神经重排序
+   - BM25 + RLRetriever（需要 GPU）：使用训练好的检索器
+
+4. **适用场景**：
+   - ✅ File 级别定位：准确率 16-26%（优于随机）
+   - ⚠️ Module/Function 级别：准确率 < 2%（接近随机，需改进）
+
+5. **与 LocAgent 的对比**：
+   - RLCoder：快速、简单、适合快速验证
+   - LocAgent：准确率高、支持多轮交互、更适合生产环境
+
+### 添加新方法
+
+1. 在 `method/` 下创建新目录（如 `method/mymethod/`）
+2. 实现 `run.py` CLI 入口，支持标准参数
+3. 可选：继承 `BaseMethod` 基类
+4. 输出标准格式的 `loc_outputs.jsonl`
+5. 使用 `evaluation/eval_metric.py` 评估
+
+示例：
+
+```python
+from method.base import LocResult, BaseMethod
+from method.utils import add_common_args, load_dataset_instances
+
+class MyMethod(BaseMethod):
+    def localize(self, instance: dict) -> LocResult:
+        # 实现定位逻辑
+        return LocResult(
+            instance_id=instance['instance_id'],
+            found_files=['src/main.py'],
+            found_modules=['src/main.py:MyClass'],
+            found_entities=['src/main.py:MyClass.method'],
+        )
+```
+
+### 统一评估
+
+所有方法的输出都可以用相同的评估命令：
+
+```python
+from evaluation.eval_metric import evaluate_results
+
+level2key = {
+    "file": "found_files",
+    "module": "found_modules", 
+    "function": "found_entities"
+}
+result = evaluate_results(
+    "outputs/xxx_results/loc_outputs.jsonl",
+    level2key,
+    dataset_path="data/Loc-Bench_V1_dataset.jsonl",
+    metrics=['acc', 'recall', 'ndcg']
+)
+print(result.to_string())
+```
+
+## 运行 BM25 基线（旧脚本）
+
+> 注意：推荐使用新框架 `method/bm25/run.py`，旧脚本 `scripts/run_bm25_baseline.py` 仍可用。
 
 ```bash
 cd /workspace/LocAgent

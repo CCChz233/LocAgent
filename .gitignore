@@ -187,3 +187,5 @@ wandb/
 outputs/
 data/
 config/
+models/
+*.tar.gz
