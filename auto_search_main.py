@@ -483,12 +483,21 @@ def run_localize(rank, args, bug_queue, log_queue, output_file_lock, traj_file_l
 
 
 def localize(args):
-    bench_data = load_dataset(args.dataset, split=args.split)
-    bench_tests = filter_dataset(bench_data, 'instance_id', args.used_list)
-    if args.eval_n_limit:
-        eval_n_limit = min(args.eval_n_limit, len(bench_tests))
-        bench_tests = bench_tests.select(range(0, eval_n_limit))
-        logging.info(f'Limiting evaluation to first {eval_n_limit} instances.')
+    # Load dataset from local file or HuggingFace
+    if args.dataset_path:
+        bench_data = load_jsonl(args.dataset_path)
+        bench_tests = bench_data
+        if args.eval_n_limit:
+            eval_n_limit = min(args.eval_n_limit, len(bench_tests))
+            bench_tests = bench_tests[:eval_n_limit]
+            logging.info(f'Limiting evaluation to first {eval_n_limit} instances.')
+    else:
+        bench_data = load_dataset(args.dataset, split=args.split)
+        bench_tests = filter_dataset(bench_data, 'instance_id', args.used_list)
+        if args.eval_n_limit:
+            eval_n_limit = min(args.eval_n_limit, len(bench_tests))
+            bench_tests = bench_tests.select(range(0, eval_n_limit))
+            logging.info(f'Limiting evaluation to first {eval_n_limit} instances.')
 
     manager = mp.Manager()
     queue = manager.Queue()
@@ -584,6 +593,7 @@ def main():
                         choices=['mrr', 'majority'])
     
     parser.add_argument("--dataset", type=str, default="princeton-nlp/SWE-bench_Lite")
+    parser.add_argument("--dataset_path", type=str, default="", help="Path to local JSONL dataset file (offline mode)")
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--eval_n_limit", type=int, default=0)
     parser.add_argument("--used_list", type=str, default='selected_ids')
@@ -595,14 +605,7 @@ def main():
     parser.add_argument(
         "--model", type=str,
         default="openai/gpt-4o-2024-05-13",
-        choices=["gpt-4o", 
-                 "azure/gpt-4o", "openai/gpt-4o-2024-05-13",
-                 "deepseek/deepseek-chat", "deepseek-ai/DeepSeek-R1",
-                 "litellm_proxy/claude-3-5-sonnet-20241022", "litellm_proxy/gpt-4o-2024-05-13", "litellm_proxy/o3-mini-2025-01-31",
-                 # fine-tuned model
-                 "openai/qwen-7B", "openai/qwen-7B-128k", "openai/ft-qwen-7B", "openai/ft-qwen-7B-128k",
-                 "openai/qwen-32B", "openai/qwen-32B-128k", "openai/ft-qwen-32B", "openai/ft-qwen-32B-128k",
-        ]
+        # choices removed to allow any model name (e.g., custom deployments)
     )
     parser.add_argument("--use_function_calling", action="store_true",
                         help='Enable function calling features of LLMs. If disabled, codeact will be used to support function calling.')

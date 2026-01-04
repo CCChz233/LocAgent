@@ -183,3 +183,7 @@ sft/
 config.toml
 unsloth_compiled_cache/
 wandb/
+# Local experiment data
+outputs/
+data/
+config/

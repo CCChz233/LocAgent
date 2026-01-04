@@ -87,6 +87,11 @@ def calc_cost(model_name, input_tokens, output_tokens):
         return 0
     elif 'qwen' in model_name.lower():
         return 0
+    elif 'deepseek' in model_name.lower():
+        return 0  # Custom DeepSeek models (e.g., volcengine)
+    elif model_name not in MODEL_COST_PER_INPUT:
+        logger.warning(f"Unknown model {model_name}, cost set to 0")
+        return 0
     
     cost = (
         MODEL_COST_PER_INPUT[model_name] * input_tokens

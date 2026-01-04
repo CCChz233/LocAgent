@@ -15,6 +15,12 @@ import os
 GRAPH_INDEX_DIR = os.environ.get("GRAPH_INDEX_DIR", "index_data/graph_index")
 
 
+def _instance_id_to_repo_name(instance_id: str) -> str:
+    """Convert instance_id (e.g., 'UXARRAY__uxarray-1117') to repo_name (e.g., 'UXARRAY_uxarray')."""
+    repo_part = re.sub(r'-\d+$', '', instance_id)
+    return repo_part.replace('__', '_')
+
+
 def parse_raw_loc_output(raw_output, valid_files):
     valid_top_folder = []
     for fn in valid_files:
@@ -59,8 +65,9 @@ def parse_raw_loc_output(raw_output, valid_files):
 
 
 def get_loc_results_from_raw_outputs(instance_id, raw_outputs, include_variable=False):
+    repo_name = _instance_id_to_repo_name(instance_id)
     G = pickle.load(
-            open(f"{GRAPH_INDEX_DIR}/{instance_id}.pkl", "rb")
+            open(f"{GRAPH_INDEX_DIR}/{repo_name}.pkl", "rb")
         )
     searcher = RepoEntitySearcher(G)
     all_files = searcher.get_all_nodes_by_type(NODE_TYPE_FILE)

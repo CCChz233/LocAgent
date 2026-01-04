@@ -71,9 +71,35 @@ def _module_id(entity_id: str) -> str:
     return f"{file_path}:{name}"
 
 
+def _instance_id_to_repo_name(instance_id: str) -> str:
+    """Convert instance_id (e.g., 'UXARRAY__uxarray-1117') to repo_name (e.g., 'UXARRAY_uxarray')."""
+    # Remove issue number suffix (e.g., '-1117')
+    import re
+    repo_part = re.sub(r'-\d+$', '', instance_id)
+    # Replace double underscore with single underscore
+    return repo_part.replace('__', '_')
+
+
 def _dedupe_append(target: List[str], item: str, limit: int) -> None:
     if item not in target and len(target) < limit:
         target.append(item)
+
+
+def _clean_file_path(file_path: str, repo_name: str) -> str:
+    """Clean file path to remove absolute path prefix and keep relative path."""
+    # Handle paths like 'workspace/LocAgent//uxarray/grid/grid.py'
+    # or '/workspace/LocAgent/playground/locbench_repos/UXARRAY_uxarray/uxarray/...'
+    import re
+    # Try to extract the relative path after the repo directory
+    # Pattern: anything ending with org_repo/ followed by the actual relative path
+    repo_pattern = repo_name.replace('_', '[_/]')  # Match both underscore and slash
+    match = re.search(rf'{repo_pattern}/(.+)$', file_path, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    # Fallback: just get the path after double slash or after last known prefix
+    if '//' in file_path:
+        return file_path.split('//')[-1]
+    return file_path
 
 
 def run_instance(
@@ -87,8 +113,9 @@ def run_instance(
     top_k_entities: int,
 ):
     instance_id = instance["instance_id"]
-    graph_index_file = osp.join(graph_index_dir, f"{instance_id}.pkl")
-    retriever_dir = osp.join(bm25_index_dir, instance_id)
+    repo_name = _instance_id_to_repo_name(instance_id)
+    graph_index_file = osp.join(graph_index_dir, f"{repo_name}.pkl")
+    retriever_dir = osp.join(bm25_index_dir, repo_name)
 
     graph = _load_graph(graph_index_file, instance, repo_base_dir, build_if_missing)
     searcher = RepoEntitySearcher(graph) if graph else None
@@ -110,10 +137,18 @@ def run_instance(
     found_modules: List[str] = []
     found_entities: List[str] = []
 
-    retrieved_nodes = retriever.retrieve(query)
+    try:
+        retrieved_nodes = retriever.retrieve(query)
+    except ValueError as e:
+        # Handle case where corpus size is smaller than top_k
+        if "corpus size should be larger than top-k" in str(e):
+            logging.warning("Corpus too small for %s: %s. Skipping.", instance_id, e)
+            return None
+        raise
     for node in retrieved_nodes:
         file_path = node.metadata.get("file_path")
         if file_path:
+            file_path = _clean_file_path(file_path, repo_name)
             _dedupe_append(found_files, file_path, top_k_files)
 
         if searcher and file_path:

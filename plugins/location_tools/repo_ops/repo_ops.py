@@ -52,6 +52,15 @@ DP_GRAPH: nx.MultiDiGraph | None = None
 
 REPO_SAVE_DIR: str | None = None
 
+
+def _instance_id_to_repo_name(instance_id: str) -> str:
+    """Convert instance_id (e.g., 'UXARRAY__uxarray-1117') to repo_name (e.g., 'UXARRAY_uxarray')."""
+    # Remove issue number suffix (e.g., '-1117')
+    repo_part = re.sub(r'-\d+$', '', instance_id)
+    # Replace double underscore with single underscore
+    return repo_part.replace('__', '_')
+
+
 def set_current_issue(instance_id: str = None, 
                       instance_data: dict = None,
                       dataset: str = "princeton-nlp/SWE-bench_Lite", split: str = "test", rank=0):
@@ -76,7 +85,8 @@ def set_current_issue(instance_id: str = None,
     
     # setup graph traverser
     global DP_GRAPH_ENTITY_SEARCHER, DP_GRAPH_DEPENDENCY_SEARCHER, DP_GRAPH
-    graph_index_file = f"{GRAPH_INDEX_DIR}/{CURRENT_ISSUE_ID}.pkl"
+    repo_name = _instance_id_to_repo_name(CURRENT_ISSUE_ID)
+    graph_index_file = f"{GRAPH_INDEX_DIR}/{repo_name}.pkl"
     if not os.path.exists(graph_index_file):
         # pull repo
         repo_dir = setup_repo(instance_data=CURRENT_INSTANCE, repo_base_dir=REPO_SAVE_DIR, dataset=None)
@@ -765,7 +775,8 @@ def bm25_content_retrieve(
     instance = get_current_issue_data()
     query = query_info.term
     
-    persist_path = os.path.join(BM25_INDEX_DIR, instance["instance_id"])
+    repo_name = _instance_id_to_repo_name(instance["instance_id"])
+    persist_path = os.path.join(BM25_INDEX_DIR, repo_name)
     if os.path.exists(f'{persist_path}/corpus.jsonl'):
         # TODO: if similairy_top_k > cache's setting, then regenerate
         retriever = load_retriever(persist_path)

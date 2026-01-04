@@ -190,7 +190,7 @@ def cal_metrics_w_file(gt_file, loc_file, key,
                         func_n = func_n[:(len(func_n)-len('.__init__'))]
                     pred_funcs[i] = f"{fle}.py:{func_n.strip('/').replace('/', '.')}"
                 elif level == 'module':
-                    module_name = f'{fle}.py:{func_n.strip('/').split('/')[0]}'
+                    module_name = f"{fle}.py:{func_n.strip('/').split('/')[0]}"
                     if module_name not in pred_modules:
                         pred_modules.append(module_name)
                     pred_dict[ins] = pred_modules
@@ -282,12 +282,20 @@ def cal_metrics_w_dataset(loc_file, key,
                 k_values,
                 metrics,
                 selected_list=None,
+                dataset_path=None,
                 ):
     assert key in ['found_files', 'found_modules', 'found_entities', 'docs']
     max_k = max(k_values)
     
     # load localization labels
-    bench_data = load_dataset(dataset, split=split)
+    if dataset_path:
+        import json
+        bench_data = []
+        with open(dataset_path, 'r') as f:
+            for line in f:
+                bench_data.append(json.loads(line))
+    else:
+        bench_data = load_dataset(dataset, split=split)
     gt_dict = collections.defaultdict(list)
     for instance in bench_data:
         if eval_level == 'file':
@@ -326,9 +334,9 @@ def cal_metrics_w_dataset(loc_file, key,
                 if eval_level == 'function':
                     if func_n.endswith('.__init__'):
                         func_n = func_n[:(len(func_n)-len('.__init__'))]
-                    pred_funcs[i] = f'{fle}.py:{func_n.strip('/').replace('/', '.')}'
+                    pred_funcs[i] = f"{fle}.py:{func_n.strip('/').replace('/', '.')}"
                 elif eval_level == 'module':
-                    module_name = f'{fle}.py:{func_n.strip('/').split('/')[0]}'
+                    module_name = f"{fle}.py:{func_n.strip('/').split('/')[0]}"
                     if module_name not in pred_modules:
                         pred_modules.append(module_name)
                     pred_dict[ins] = pred_modules
@@ -382,7 +390,8 @@ def evaluate_results(loc_file, level2key_dict,
                      dataset='czlll/SWE-bench_Lite', split='test', 
                      selected_list=None,
                      metrics=['acc', 'ndcg', 'precision', 'recall', 'map'], 
-                     k_values_list=None):
+                     k_values_list=None,
+                     dataset_path=None):
     if not k_values_list:
         k_values_list = [
             [1, 3, 5],
@@ -392,15 +401,18 @@ def evaluate_results(loc_file, level2key_dict,
     file_res = cal_metrics_w_dataset(loc_file, level2key_dict['file'], 'file', dataset, split, 
                             metrics=metrics,
                             k_values=k_values_list[0],
-                            selected_list=selected_list)
+                            selected_list=selected_list,
+                            dataset_path=dataset_path)
     module_res = cal_metrics_w_dataset(loc_file, level2key_dict['module'], 'module', dataset, split, 
                             metrics=metrics,
                             k_values=k_values_list[1],
-                            selected_list=selected_list)
+                            selected_list=selected_list,
+                            dataset_path=dataset_path)
     function_res = cal_metrics_w_dataset(loc_file, level2key_dict['function'], 'function', dataset, split, 
                             metrics=metrics,
                             k_values=k_values_list[2],
-                            selected_list=selected_list)
+                            selected_list=selected_list,
+                            dataset_path=dataset_path)
 
     all_df = pd.concat([pd.DataFrame(res, index=[0])
                           for res in [file_res, module_res, function_res]], 
