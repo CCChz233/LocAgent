@@ -1,0 +1,37 @@
+{
+  "dataset_path": "data/Loc-Bench_V1_dataset.jsonl",
+  "repos_root": "playground/locbench_repos",
+  "compare_output": "outputs/compare_retrieval.csv",
+  "eval_n_limit": 10,
+  "methods": [
+    {
+      "name": "bm25",
+      "type": "bm25",
+      "output_folder": "outputs/bm25_locbench",
+      "graph_index_dir": "index_data/Loc-Bench_V1/graph_index_v2.3",
+      "bm25_index_dir": "index_data/Loc-Bench_V1/BM25_index"
+    },
+    {
+      "name": "dense_rlretriever",
+      "type": "locator",
+      "mode": "dense",
+      "model_name": "models/rlretriever",
+      "output_folder": "outputs/repocoder_dense",
+      "block_size": 15,
+      "max_length": 512,
+      "batch_size": 8,
+      "top_k_blocks": 50,
+      "top_k_files": 10,
+      "max_blocks_per_file": 2
+    },
+    {
+      "name": "jaccard_locator",
+      "type": "locator",
+      "mode": "jaccard",
+      "output_folder": "outputs/repocoder_jaccard",
+      "block_size": 15,
+      "top_k_blocks": 50,
+      "top_k_files": 10
+    }
+  ]
+}

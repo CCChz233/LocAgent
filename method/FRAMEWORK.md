@@ -131,3 +131,120 @@
     --max_blocks_per_file 2
   # 生成 embeddings.pt + metadata.jsonl 后，再在服务器跑全量
   ```
+
+## 对比评测流水线（分阶段）
+### 第 1 阶段：准备索引
+- 图索引（若缺）：`bash scripts/gen_graph_index.sh`
+- BM25 索引（Loc-Bench V1，全量示例）：
+  ```bash
+  export PYTHONPATH=$(pwd)
+  python build_bm25_index.py \
+    --dataset czlll/Loc-Bench_V1 \
+    --split test \
+    --repo_path playground/locbench_repos \
+    --index_dir index_data \
+    --num_processes 4
+  ```
+  生成到 `index_data/Loc-Bench_V1/BM25_index/`。若只跑子集，可调 `--num_processes` 并在对比配置中设置 `eval_n_limit`。
+- 稠密/Jaccard locator 无需预建索引（运行时现场切块编码/分词），仅需模型（dense 模式）。
+
+### 第 2 阶段：运行对比与评测
+- 使用配置化运行器（默认配置在 `configs/retrieval_benchmark.json`，含 bm25/dense/jaccard）：
+  ```bash
+  export PYTHONPATH=$(pwd)
+  python scripts/run_retrieval_benchmark.py --config configs/retrieval_benchmark.json
+  ```
+  - 若未准备 BM25 索引，可在配置文件里移除 bm25 方法，或先完成第 1 阶段再运行。
+  - 配置项关键字段：
+    - `dataset_path`: `data/Loc-Bench_V1_dataset.jsonl`
+    - `repos_root`: `playground/locbench_repos`
+    - `methods`: 方法列表（bm25/locator-dense/locator-jaccard 等），各自 `output_folder`、参数。
+    - `eval_n_limit`: 小样本冒烟（设 0 为全量）。
+  - 输出：每方法的 `loc_outputs.jsonl` + `eval_results.csv`；汇总表 `outputs/compare_*.csv`。
+
+## 支持的基线与位置
+- BM25 基线：`scripts/run_bm25_baseline.py`（需 graph_index + BM25_index）
+- Dense 定位（RLRetriever）：`method/RepoCoder/run_locator.py --mode dense`（模型默认 `models/rlretriever`）
+- Jaccard/BoW 定位：`method/RepoCoder/run_locator.py --mode jaccard`（无模型依赖）
+- 稠密索引构建（固定行、不重叠）：`method/RLCoder/build_dense_index.py`
+- 滑窗稠密索引构建（RepoCoder 风格 window_size/slice_size）：`method/RepoCoder/build_sliding_index.py`
+- RLCoder 原论文分块（未编码，输出块清单）：`method/RLCoder/build_fixed_blocks.py`
+
+### 简化入口（拆分到独立子目录）
+- BM25 运行：`method/bm25/run.py`（包装 `scripts/run_bm25_baseline.py`）
+- Dense 索引：`method/dense/build_index.py`（包装 `method/RLCoder/build_dense_index.py`）
+- Dense 检索：`method/dense/run.py`（包装 `run_locator.py --mode dense`）
+- Jaccard 检索：`method/jaccard/run.py`（包装 `run_locator.py --mode jaccard`）
+- 滑窗稠密索引：`method/sliding/build_index.py`（包装 `method/RepoCoder/build_sliding_index.py`）
+
+### 常用索引构建命令
+- 统一稠密索引（多策略可选：fixed/sliding/rl_fixed/rl_mini）：
+  ```bash
+  export TOKENIZERS_PARALLELISM=false
+  python method/index/build_index.py \
+    --repo_path /path/to/repo \
+    --output_dir index_data/index_fixed_rlretriever \
+    --model_name models/rlretriever \
+    --strategy fixed \           # 或 sliding / rl_fixed / rl_mini
+    --block_size 15 \            # strategy=fixed 时使用
+    --window_size 20 --slice_size 2 \  # strategy=sliding 时使用
+    --max_length 512 --batch_size 8
+  ```
+- RLCoder 分块+索引一步到位示例：
+  ```bash
+  # 固定块（12 非空行）
+  python method/index/build_index.py \
+    --repo_path /path/to/repo \
+    --output_dir index_data/index_rl_fixed \
+    --model_name models/rlretriever \
+    --strategy rl_fixed \
+    --max_length 512 --batch_size 8
+  # mini_block（空行分段、≤15 行）
+  python method/index/build_index.py \
+    --repo_path /path/to/repo \
+    --output_dir index_data/index_rl_mini \
+    --model_name models/rlretriever \
+    --strategy rl_mini \
+    --max_length 512 --batch_size 8
+  ```
+- 固定行稠密索引（RLRetriever，示例）：
+  ```bash
+  export TOKENIZERS_PARALLELISM=false
+  python method/RLCoder/build_dense_index.py \
+    --repo_path /path/to/repo \
+    --output_dir index_data/RLCoder/<name>_dense \
+    --model_name models/rlretriever \
+    --block_size 15 --max_length 512 --batch_size 8
+  ```
+- 滑窗稠密索引（RepoCoder 风格）：
+  ```bash
+  export TOKENIZERS_PARALLELISM=false
+  python method/RepoCoder/build_sliding_index.py \
+    --repo_path /path/to/repo \
+    --output_dir index_data/RepoCoder/<name>_sliding \
+    --model_name models/rlretriever \
+    --window_size 20 --slice_size 2 \
+    --max_length 512 --batch_size 8
+  ```
+- RLCoder 原论文分块清单（未编码）：
+  ```bash
+  # fixed_block（12 非空行一块）
+  python method/RLCoder/build_fixed_blocks.py \
+    --repo_path /path/to/repo \
+    --output_path index_data/RLCoder/blocks_fixed.jsonl \
+    --enable_fixed_block
+  # mini_block（默认，空行分段再拼 ≤15 行）
+  python method/RLCoder/build_fixed_blocks.py \
+    --repo_path /path/to/repo \
+    --output_path index_data/RLCoder/blocks_mini.jsonl
+  ```
+- BM25 索引（Loc-Bench V1 示例）：
+  ```bash
+  export PYTHONPATH=$(pwd)
+  python build_bm25_index.py \
+    --dataset czlll/Loc-Bench_V1 \
+    --split test \
+    --repo_path playground/locbench_repos \
+    --index_dir index_data \
+    --num_processes 4
+  ```
