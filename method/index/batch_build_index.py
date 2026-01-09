@@ -193,6 +193,378 @@ def blocks_rl_mini(text: str, rel: str, max_lines: int = 5000) -> List[Block]:
     return blocks
 
 
+# ============================================================================
+# IR-based 函数级分块（论文复现）
+# Paper: Appendix C.1.1
+# "The function's context—its containing file and class—is appended to 
+# the function representation before embedding, rather than being embedded separately."
+# ============================================================================
+
+
+def _extract_module_level_code(tree: ast.AST, lines: List[str]) -> str:
+    """
+    提取模块级代码：imports, 全局变量, 顶层赋值等
+    
+    按照论文：这些代码会被冗余复制到该文件每个函数的表示中
+    
+    Args:
+        tree: AST 树
+        lines: 源代码行列表
+    
+    Returns:
+        模块级代码字符串（多行合并为单行，空格分隔）
+    """
+    module_level_parts = []
+    
+    for node in tree.body:
+        # import 语句
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            start = node.lineno - 1
+            end = node.end_lineno if hasattr(node, 'end_lineno') else start + 1
+            code = " ".join(lines[start:end])  # 合并为单行
+            module_level_parts.append(code.strip())
+        
+        # 全局变量赋值
+        elif isinstance(node, ast.Assign):
+            start = node.lineno - 1
+            end = node.end_lineno if hasattr(node, 'end_lineno') else start + 1
+            code = " ".join(lines[start:end])
+            module_level_parts.append(code.strip())
+        
+        # 带类型注解的赋值 (e.g., DEBUG: bool = True)
+        elif isinstance(node, ast.AnnAssign):
+            start = node.lineno - 1
+            end = node.end_lineno if hasattr(node, 'end_lineno') else start + 1
+            code = " ".join(lines[start:end])
+            module_level_parts.append(code.strip())
+    
+    return " ".join(module_level_parts)
+
+
+def _extract_class_attributes(class_node: ast.ClassDef, lines: List[str]) -> str:
+    """
+    提取类属性（非方法的类级别定义）
+    
+    按照论文：类属性会被冗余复制到该类每个方法的表示中
+    
+    Args:
+        class_node: 类的 AST 节点
+        lines: 源代码行列表
+    
+    Returns:
+        类属性代码字符串（多行合并为单行，空格分隔）
+    """
+    class_attr_parts = []
+    
+    for node in class_node.body:
+        # 类属性赋值
+        if isinstance(node, ast.Assign):
+            start = node.lineno - 1
+            end = node.end_lineno if hasattr(node, 'end_lineno') else start + 1
+            code = " ".join(lines[start:end])
+            class_attr_parts.append(code.strip())
+        
+        # 带类型注解的类属性
+        elif isinstance(node, ast.AnnAssign):
+            start = node.lineno - 1
+            end = node.end_lineno if hasattr(node, 'end_lineno') else start + 1
+            code = " ".join(lines[start:end])
+            class_attr_parts.append(code.strip())
+    
+    return " ".join(class_attr_parts)
+
+
+def _build_ir_function_representation(
+    file_path: str,
+    class_name: Optional[str],
+    function_code: str,
+    module_level_code: str,
+    class_attributes: str,
+) -> str:
+    """
+    按照论文 IR-based 方法构建函数表示
+    
+    论文原文 (Appendix C.1.1):
+    "The function's context—its containing file and class—is appended to 
+    the function representation before embedding"
+    
+    格式: {file_path} {class_name} {module_level_code} {class_attributes} {function_code}
+    
+    Args:
+        file_path: 文件路径
+        class_name: 类名（如果是方法）
+        function_code: 函数源代码
+        module_level_code: 模块级代码（imports, 全局变量等）
+        class_attributes: 类属性代码（如果是方法）
+    
+    Returns:
+        完整的函数表示，用于 embedding
+    """
+    parts = [file_path]
+    
+    if class_name:
+        parts.append(class_name)
+    
+    # 添加模块级上下文（冗余复制到每个函数）
+    if module_level_code.strip():
+        parts.append(module_level_code.strip())
+    
+    # 添加类属性（如果是类方法）
+    if class_attributes.strip():
+        parts.append(class_attributes.strip())
+    
+    # 添加函数代码
+    parts.append(function_code)
+    
+    return " ".join(parts)
+
+
+def blocks_ir_function(text: str, rel: str) -> Tuple[List[Block], Dict[int, Dict[str, Optional[str]]]]:
+    """
+    按照论文 IR-based 方法提取函数级代码块（Paper Reproduction）
+    
+    论文关键特点（Appendix C.1.1）：
+    1. 每个函数单独作为一个嵌入单元（embedding unit）
+    2. 模块级代码（imports, 全局变量）冗余复制到该文件每个函数
+    3. 类属性冗余复制到该类每个方法
+    4. 使用 Flat Indexing（无层级结构，无单独的全局变量索引）
+    5. 非 Python 文件不处理（只索引函数）
+    
+    与我们的 function_level 的区别：
+    - function_level: 只有 qualified_name + 函数代码
+    - ir_function: file_path + class_name + module_code + class_attrs + 函数代码
+    
+    Args:
+        text: 文件内容
+        rel: 相对文件路径
+    
+    Returns:
+        (blocks, function_metadata): 代码块列表和函数元数据字典
+    """
+    blocks: List[Block] = []
+    function_metadata: Dict[int, Dict[str, Optional[str]]] = {}
+    
+    # 只处理 Python 文件（论文只在函数级别索引）
+    if not rel.endswith('.py'):
+        return blocks, function_metadata
+    
+    # 检查文件大小
+    if len(text) > 10 * 1024 * 1024:  # 10MB
+        logging.debug(f"File {rel} is too large, skipping")
+        return blocks, function_metadata
+    
+    try:
+        tree = ast.parse(text)
+        lines = text.splitlines()
+        
+        # 1. 提取模块级代码（将冗余复制到每个函数）
+        module_level_code = _extract_module_level_code(tree, lines)
+        
+        def get_function_code(node) -> str:
+            """获取函数的完整代码（包括装饰器）"""
+            func_start = node.lineno - 1
+            func_end = node.end_lineno if hasattr(node, 'end_lineno') else func_start + 10
+            
+            # 获取装饰器起始行
+            decorator_start = func_start
+            if node.decorator_list:
+                first_decorator = node.decorator_list[0]
+                if hasattr(first_decorator, 'lineno'):
+                    decorator_start = first_decorator.lineno - 1
+            
+            all_lines = lines[decorator_start:func_end]
+            return "\n".join(all_lines)
+        
+        def process_function(
+            node,
+            class_name: Optional[str] = None,
+            class_attributes: str = "",
+        ):
+            """处理单个函数/方法"""
+            nonlocal blocks, function_metadata
+            
+            function_name = node.name
+            
+            # 获取行号范围
+            start_line = node.lineno - 1
+            end_line = node.end_lineno - 1 if hasattr(node, 'end_lineno') else start_line + 10
+            
+            # 包含装饰器的起始行
+            if node.decorator_list:
+                first_decorator = node.decorator_list[0]
+                if hasattr(first_decorator, 'lineno'):
+                    start_line = first_decorator.lineno - 1
+            
+            # 获取函数代码
+            func_code = get_function_code(node)
+            if not func_code.strip():
+                return
+            
+            # 构建完全限定名（用于 metadata）
+            if class_name:
+                qualified_name = f"{rel}::{class_name}::{function_name}"
+            else:
+                qualified_name = f"{rel}::{function_name}"
+            
+            # 按照论文方式构建 IR 表示
+            ir_representation = _build_ir_function_representation(
+                file_path=rel,
+                class_name=class_name,
+                function_code=func_code,
+                module_level_code=module_level_code,
+                class_attributes=class_attributes,
+            )
+            
+            # 创建 Block
+            block = Block(rel, start_line, end_line, ir_representation, "ir_function")
+            block_index = len(blocks)
+            blocks.append(block)
+            
+            # 保存元数据
+            function_metadata[block_index] = {
+                "qualified_name": qualified_name,
+                "class_name": class_name,
+                "function_name": function_name,
+            }
+            
+            # 递归处理嵌套函数
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    process_function(child, class_name, class_attributes)
+        
+        # 2. 遍历 AST 顶层节点
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                # 提取类属性（将冗余复制到该类每个方法）
+                class_attributes = _extract_class_attributes(node, lines)
+                
+                # 处理类中的方法
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        process_function(child, node.name, class_attributes)
+                    # 处理嵌套类
+                    elif isinstance(child, ast.ClassDef):
+                        nested_class_attrs = _extract_class_attributes(child, lines)
+                        for nested_child in child.body:
+                            if isinstance(nested_child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                process_function(
+                                    nested_child, 
+                                    f"{node.name}.{child.name}", 
+                                    nested_class_attrs
+                                )
+            
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # 顶层函数（没有类属性）
+                process_function(node, None, "")
+    
+    except SyntaxError as e:
+        logging.debug(f"Syntax error in {rel} (line {e.lineno}): {e.msg}. Skipping.")
+        return blocks, function_metadata
+    except Exception as e:
+        logging.error(f"Error processing {rel}: {type(e).__name__}: {e}. Skipping.")
+        return blocks, function_metadata
+    
+    return blocks, function_metadata
+
+
+def collect_ir_function_blocks(repo_path: str) -> Tuple[List[Block], Dict[int, Dict[str, Optional[str]]]]:
+    """
+    收集 IR-based 函数级代码块（论文复现版本）
+    
+    按照论文 Appendix C.1.1：
+    - 每个函数单独作为一个嵌入单元
+    - 模块级代码冗余复制到该文件每个函数
+    - 类属性冗余复制到该类每个方法
+    - 只索引 Python 文件中的函数
+    
+    Args:
+        repo_path: 仓库路径
+    
+    Returns:
+        (blocks, function_metadata): 代码块列表和函数元数据字典
+    """
+    logger = logging.getLogger(__name__)
+    repo_root = Path(repo_path)
+    all_blocks: List[Block] = []
+    all_function_metadata: Dict[int, Dict[str, Optional[str]]] = {}
+    
+    # 只处理 Python 文件
+    python_files = [p for p in iter_files(repo_root) if p.suffix.lower() == '.py']
+    total_files = len(python_files)
+    
+    if total_files == 0:
+        logger.debug(f"No Python files found in {repo_path}")
+        return all_blocks, all_function_metadata
+    
+    logger.info(f"Processing {total_files} Python files in {repo_path} (IR-based paper style)")
+    
+    stats = {
+        'total_files': total_files,
+        'processed': 0,
+        'skipped': 0,
+        'errors': 0,
+        'total_functions': 0,
+        'files_with_functions': 0,
+    }
+    
+    for p in python_files:
+        stats['processed'] += 1
+        
+        # 检查文件大小
+        try:
+            file_size = p.stat().st_size
+            if file_size > 10 * 1024 * 1024:  # 10MB
+                logger.debug(f"Skipping large file {p.name}")
+                stats['skipped'] += 1
+                continue
+        except Exception:
+            stats['skipped'] += 1
+            continue
+        
+        # 读取文件
+        try:
+            text = p.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                text = p.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                stats['skipped'] += 1
+                continue
+        except Exception:
+            stats['skipped'] += 1
+            continue
+        
+        rel = str(p.relative_to(repo_root))
+        
+        # 使用 IR-based 方法提取
+        file_blocks, file_metadata = blocks_ir_function(text, rel)
+        
+        # 调整 metadata 索引
+        current_start_idx = len(all_blocks)
+        for local_idx, metadata in file_metadata.items():
+            global_idx = current_start_idx + local_idx
+            all_function_metadata[global_idx] = metadata
+        
+        all_blocks.extend(file_blocks)
+        
+        if file_blocks:
+            stats['files_with_functions'] += 1
+            stats['total_functions'] += len(file_blocks)
+    
+    logger.info(
+        f"Collected {len(all_blocks)} IR-style function blocks from {repo_path} "
+        f"(files: {stats['files_with_functions']}, "
+        f"avg per file: {stats['total_functions'] / max(stats['files_with_functions'], 1):.1f})"
+    )
+    
+    return all_blocks, all_function_metadata
+
+
+# ============================================================================
+# 原有的 function_level 实现（保留兼容）
+# ============================================================================
+
+
 def build_function_context_content(
     file_path: str,
     class_name: Optional[str],
@@ -223,6 +595,103 @@ def build_function_context_content(
     # 只添加一行注释作为标识符
     header = f"# {qualified_name}\n\n"
     return header + original_code
+
+
+def blocks_function_level_with_fallback(
+    text: str, 
+    rel: str, 
+    block_size: int = 15
+) -> Tuple[List[Block], Dict[int, Dict[str, Optional[str]]]]:
+    """
+    函数级切块 + 未覆盖代码的 fixed 切块作为补充
+    
+    解决 function_level 策略只索引函数、遗漏大量非函数代码的问题：
+    - 模块级代码（全局变量、常量定义、import 语句）
+    - 类定义本身（类属性、类级代码）
+    - 脚本入口代码（if __name__ == "__main__": 下的非函数代码）
+    
+    Args:
+        text: 文件内容
+        rel: 相对文件路径
+        block_size: 对未覆盖代码使用的 fixed 切块大小，默认 15 行
+    
+    Returns:
+        (blocks, function_metadata): 代码块列表和函数元数据字典
+    """
+    # 1. 先提取所有函数级块
+    function_blocks, function_metadata = blocks_by_function(text, rel)
+    
+    # 非 Python 文件或解析失败时，直接使用 fixed 策略
+    if not rel.endswith('.py') or not function_blocks:
+        fixed_blocks = blocks_fixed_lines(text, rel, block_size)
+        # 修改 block_type 以区分
+        for b in fixed_blocks:
+            b.block_type = "function_level_fallback"
+        return fixed_blocks, {}
+    
+    # 2. 记录被函数覆盖的行号
+    lines = text.splitlines()
+    total_lines = len(lines)
+    covered_lines = set()
+    
+    for block in function_blocks:
+        for line_no in range(block.start, block.end + 1):
+            covered_lines.add(line_no)
+    
+    # 3. 找出未被覆盖的连续行区间
+    uncovered_ranges = []
+    current_start = None
+    
+    for i in range(total_lines):
+        if i not in covered_lines:
+            if current_start is None:
+                current_start = i
+        else:
+            if current_start is not None:
+                uncovered_ranges.append((current_start, i - 1))
+                current_start = None
+    
+    # 处理末尾的未覆盖区间
+    if current_start is not None:
+        uncovered_ranges.append((current_start, total_lines - 1))
+    
+    # 4. 对未覆盖的区间使用 fixed 策略切分
+    fallback_blocks = []
+    for range_start, range_end in uncovered_ranges:
+        # 提取该区间的文本
+        range_lines = lines[range_start:range_end + 1]
+        range_text = "\n".join(range_lines)
+        
+        # 跳过全空区间
+        if not any(l.strip() for l in range_lines):
+            continue
+        
+        # 对该区间使用 fixed 切块
+        chunk_start = 0
+        while chunk_start < len(range_lines):
+            chunk_end = min(chunk_start + block_size, len(range_lines))
+            chunk_lines = range_lines[chunk_start:chunk_end]
+            
+            # 跳过全空块
+            if any(l.strip() for l in chunk_lines):
+                # 计算在原文件中的真实行号
+                real_start = range_start + chunk_start
+                real_end = range_start + chunk_end - 1
+                content = "\n".join(chunk_lines)
+                
+                fallback_blocks.append(Block(
+                    rel, real_start, real_end, content, "function_level_fallback"
+                ))
+            
+            chunk_start = chunk_end
+    
+    # 5. 合并函数块和补充块
+    all_blocks = function_blocks + fallback_blocks
+    
+    # 按起始行号排序，保持文件顺序
+    all_blocks.sort(key=lambda b: b.start)
+    
+    return all_blocks, function_metadata
 
 
 def blocks_by_function(text: str, rel: str) -> Tuple[List[Block], Dict[int, Dict[str, Optional[str]]]]:
@@ -452,7 +921,12 @@ def collect_blocks(repo_path: str, strategy: str, block_size: int, window_size: 
         elif strategy == "rl_mini":
             blocks.extend(blocks_rl_mini(text, rel))
         elif strategy == "function_level":
-            file_blocks, _ = blocks_by_function(text, rel)
+            # 使用带 fallback 的函数级切块，确保完整覆盖
+            file_blocks, _ = blocks_function_level_with_fallback(text, rel, block_size)
+            blocks.extend(file_blocks)
+        elif strategy == "ir_function":
+            # 论文 IR-based 方法：只索引函数，上下文冗余附加
+            file_blocks, _ = blocks_ir_function(text, rel)
             blocks.extend(file_blocks)
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
@@ -1431,12 +1905,17 @@ def collect_llamaindex_semantic_blocks(
     return blocks
 
 
-def collect_function_blocks(repo_path: str) -> Tuple[List[Block], Dict[int, Dict[str, Optional[str]]]]:
+def collect_function_blocks(repo_path: str, block_size: int = 15) -> Tuple[List[Block], Dict[int, Dict[str, Optional[str]]]]:
     """
-    收集函数级代码块，返回blocks和function_metadata
+    收集函数级代码块（带 fallback），返回blocks和function_metadata
+    
+    改进：使用 blocks_function_level_with_fallback，确保完整覆盖所有代码：
+    - 函数和方法使用 function_level 切块
+    - 未被函数覆盖的代码（imports、全局变量、类属性等）使用 fixed 切块补充
     
     Args:
         repo_path: 仓库路径
+        block_size: 对未覆盖代码使用的 fixed 切块大小，默认 15 行
     
     Returns:
         (blocks, function_metadata): 代码块列表和函数元数据字典
@@ -1449,26 +1928,28 @@ def collect_function_blocks(repo_path: str) -> Tuple[List[Block], Dict[int, Dict
     all_blocks: List[Block] = []
     all_function_metadata: Dict[int, Dict[str, Optional[str]]] = {}
     
-    # 获取所有Python文件
-    python_files = [p for p in iter_files(repo_root) if p.suffix.lower() == '.py']
-    total_files = len(python_files)
+    # 获取所有支持的文件（不仅是 Python）
+    all_files = list(iter_files(repo_root))
+    total_files = len(all_files)
     
     if total_files == 0:
-        logger.debug(f"No Python files found in {repo_path}")
+        logger.debug(f"No supported files found in {repo_path}")
         return all_blocks, all_function_metadata
     
-    logger.info(f"Processing {total_files} Python files in {repo_path}")
+    logger.info(f"Processing {total_files} files in {repo_path}")
     
     stats = {
         'total_files': total_files,
         'processed': 0,
         'skipped': 0,
         'errors': 0,
-        'total_functions': 0,
-        'files_with_functions': 0,
+        'total_blocks': 0,
+        'function_blocks': 0,
+        'fallback_blocks': 0,
+        'files_with_blocks': 0,
     }
     
-    for p in python_files:
+    for p in all_files:
         stats['processed'] += 1
         if stats['processed'] % 100 == 0:
             logger.debug(f"Processed {stats['processed']}/{total_files} files in {repo_path} (skipped: {stats['skipped']}, errors: {stats['errors']})")
@@ -1501,9 +1982,9 @@ def collect_function_blocks(repo_path: str) -> Tuple[List[Block], Dict[int, Dict
         
         rel = str(p.relative_to(repo_root))
         
-        # blocks_by_function内部已经处理了所有异常，这里不需要try-except
+        # 使用带 fallback 的函数级切块
         try:
-            file_blocks, file_metadata = blocks_by_function(text, rel)
+            file_blocks, file_metadata = blocks_function_level_with_fallback(text, rel, block_size)
             
             # 调整metadata的索引（因为要合并到all_blocks中）
             current_start_idx = len(all_blocks)
@@ -1515,23 +1996,29 @@ def collect_function_blocks(repo_path: str) -> Tuple[List[Block], Dict[int, Dict
             
             # 更新统计
             if file_blocks:
-                stats['files_with_functions'] += 1
-                stats['total_functions'] += len(file_blocks)
+                stats['files_with_blocks'] += 1
+                stats['total_blocks'] += len(file_blocks)
+                # 分别统计函数块和 fallback 块
+                for b in file_blocks:
+                    if b.block_type == "function_level":
+                        stats['function_blocks'] += 1
+                    else:
+                        stats['fallback_blocks'] += 1
         except Exception as e:
             logger.error(f"Error processing file {rel}: {e}")
             stats['errors'] += 1
             continue
     
     logger.info(
-        f"Collected {len(all_blocks)} function blocks from {repo_path} "
-        f"(processed: {stats['processed']}, skipped: {stats['skipped']}, "
-        f"errors: {stats['errors']}, files with functions: {stats['files_with_functions']}, "
-        f"avg functions per file: {stats['total_functions'] / max(stats['files_with_functions'], 1):.1f})"
+        f"Collected {len(all_blocks)} blocks from {repo_path} "
+        f"(function: {stats['function_blocks']}, fallback: {stats['fallback_blocks']}, "
+        f"processed: {stats['processed']}, skipped: {stats['skipped']}, "
+        f"errors: {stats['errors']}, files with blocks: {stats['files_with_blocks']})"
     )
     
     # 如果没有提取到任何blocks，返回空（让上层决定是否跳过或标记为失败）
     if not all_blocks:
-        logger.warning(f"No function blocks extracted from {repo_path}")
+        logger.warning(f"No blocks extracted from {repo_path}")
         return all_blocks, all_function_metadata
     
     return all_blocks, all_function_metadata

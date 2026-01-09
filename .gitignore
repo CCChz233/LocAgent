@@ -189,3 +189,4 @@ data/
 config/
 models/
 *.tar.gz
+CodeRankEmbed/
