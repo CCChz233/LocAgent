@@ -13,7 +13,6 @@ from dataclasses_json import DataClassJsonMixin
 from fsspec.implementations.local import LocalFileSystem
 from llama_index.core.bridge.pydantic import PrivateAttr
 from llama_index.core.schema import BaseNode
-from llama_index.core.vector_stores.simple import _build_metadata_filter_fn
 from llama_index.core.vector_stores.types import (
     DEFAULT_PERSIST_DIR,
     BasePydanticVectorStore,
@@ -21,7 +20,10 @@ from llama_index.core.vector_stores.types import (
     VectorStoreQueryMode,
     VectorStoreQueryResult,
 )
-from llama_index.core.vector_stores.utils import node_to_metadata_dict
+from llama_index.core.vector_stores.utils import (
+    node_to_metadata_dict,
+    build_metadata_filter_fn,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +173,7 @@ class SimpleFaissVectorStore(BasePydanticVectorStore):
             similarity_top_k (int): top k most similar nodes
 
         """
-        query_filter_fn = _build_metadata_filter_fn(
+        query_filter_fn = build_metadata_filter_fn(
             lambda node_id: self._data.metadata_dict[node_id], query.filters
         )
 

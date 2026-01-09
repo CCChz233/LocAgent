@@ -7,10 +7,8 @@ BM25 检索器核心逻辑
 import logging
 from typing import List, Optional
 
-from dependency_graph import RepoEntitySearcher
-from dependency_graph.build_graph import NODE_TYPE_CLASS, NODE_TYPE_FUNCTION
-
 from method.base import LocResult, BaseMethod
+from method.mapping import GraphBasedMapper, ASTBasedMapper
 from method.utils import (
     get_problem_text,
     instance_id_to_repo_name,
@@ -21,14 +19,6 @@ from method.utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _module_id(entity_id: str) -> str:
-    """从实体 ID 提取模块 ID"""
-    file_path, name = entity_id.split(":", 1)
-    if "." in name:
-        name = name.split(".")[0]
-    return f"{file_path}:{name}"
 
 
 class BM25Method(BaseMethod):
@@ -46,22 +36,46 @@ class BM25Method(BaseMethod):
         top_k_files: int = 10,
         top_k_modules: int = 10,
         top_k_entities: int = 10,
+        mapper_type: str = "graph",
+        repos_root: Optional[str] = None,
     ):
         """
         初始化 BM25 方法
         
         Args:
-            graph_index_dir: 图索引目录
+            graph_index_dir: 图索引目录（mapper_type='graph'时必需）
             bm25_index_dir: BM25 索引目录
             top_k_files: 返回的文件数量
             top_k_modules: 返回的模块数量
             top_k_entities: 返回的实体数量
+            mapper_type: 映射器类型，'graph' 或 'ast'，默认 'graph'
+            repos_root: 源代码仓库根目录（mapper_type='ast'时必需）
         """
         self.graph_index_dir = graph_index_dir
         self.bm25_index_dir = bm25_index_dir
         self.top_k_files = top_k_files
         self.top_k_modules = top_k_modules
         self.top_k_entities = top_k_entities
+        self.mapper_type = mapper_type
+        self.repos_root = repos_root
+        
+        # 根据mapper_type选择映射器
+        if mapper_type == "graph":
+            if not self.graph_index_dir:
+                raise ValueError(
+                    "mapper_type='graph' 时必须提供 graph_index_dir 参数。\n"
+                    "示例: BM25Method(..., graph_index_dir='index_data/.../graph_index_v2.3', mapper_type='graph')"
+                )
+            self.mapper = GraphBasedMapper(graph_index_dir=self.graph_index_dir)
+        elif mapper_type == "ast":
+            if not self.repos_root:
+                raise ValueError(
+                    "mapper_type='ast' 时必须提供 repos_root 参数。\n"
+                    "示例: BM25Method(..., repos_root='playground/locbench_repos', mapper_type='ast')"
+                )
+            self.mapper = ASTBasedMapper(repos_root=self.repos_root)
+        else:
+            raise ValueError(f"未知的 mapper_type: {mapper_type}，必须是 'graph' 或 'ast'")
     
     @property
     def name(self) -> str:
@@ -80,10 +94,7 @@ class BM25Method(BaseMethod):
         instance_id = instance["instance_id"]
         repo_name = instance_id_to_repo_name(instance_id)
         
-        # 加载图索引和 BM25 检索器
-        graph = load_graph_index(instance_id, self.graph_index_dir)
-        searcher = RepoEntitySearcher(graph) if graph else None
-        
+        # 加载 BM25 检索器
         retriever = load_bm25_retriever(instance_id, self.bm25_index_dir)
         if retriever is None:
             logger.warning(f"Missing BM25 index for {instance_id}. Returning empty result.")
@@ -113,35 +124,28 @@ class BM25Method(BaseMethod):
                 return LocResult.empty(instance_id)
             raise
         
-        # 处理检索结果
+        # 处理检索结果：提取文件列表
+        block_metadata_list = []
         for node in retrieved_nodes:
             file_path = node.metadata.get("file_path")
             if file_path:
                 file_path = clean_file_path(file_path, repo_name)
                 dedupe_append(found_files, file_path, self.top_k_files)
+                # 收集代码块metadata用于映射
+                block_metadata_list.append(node.metadata)
             
-            # 使用图索引提取模块和实体
-            if searcher and file_path:
-                span_ids = node.metadata.get("span_ids", [])
-                for span_id in span_ids:
-                    entity_id = f"{file_path}:{span_id}"
-                    if not searcher.has_node(entity_id):
-                        continue
-                    
-                    node_data = searcher.get_node_data([entity_id])[0]
-                    if node_data["type"] == NODE_TYPE_FUNCTION:
-                        dedupe_append(found_entities, entity_id, self.top_k_entities)
-                        dedupe_append(found_modules, _module_id(entity_id), self.top_k_modules)
-                    elif node_data["type"] == NODE_TYPE_CLASS:
-                        dedupe_append(found_modules, entity_id, self.top_k_modules)
-            
-            # 检查是否已达到所需数量
-            if (
-                len(found_files) >= self.top_k_files
-                and len(found_modules) >= self.top_k_modules
-                and len(found_entities) >= self.top_k_entities
-            ):
+            # 检查是否已达到文件数量限制
+            if len(found_files) >= self.top_k_files:
                 break
+        
+        # 使用映射器提取模块和实体
+        if block_metadata_list:
+            found_modules, found_entities = self.mapper.map_blocks_to_entities(
+                blocks=block_metadata_list,
+                instance_id=instance_id,
+                top_k_modules=self.top_k_modules,
+                top_k_entities=self.top_k_entities,
+            )
         
         return LocResult(
             instance_id=instance_id,
@@ -158,17 +162,21 @@ def run_bm25_localization(
     top_k_files: int = 10,
     top_k_modules: int = 10,
     top_k_entities: int = 10,
+    mapper_type: str = "graph",
+    repos_root: Optional[str] = None,
 ) -> LocResult:
     """
     运行 BM25 定位（函数式接口）
     
     Args:
         instance: 数据集实例
-        graph_index_dir: 图索引目录
+        graph_index_dir: 图索引目录（mapper_type='graph'时必需）
         bm25_index_dir: BM25 索引目录
         top_k_files: 返回的文件数量
         top_k_modules: 返回的模块数量
         top_k_entities: 返回的实体数量
+        mapper_type: 映射器类型，'graph' 或 'ast'，默认 'graph'
+        repos_root: 源代码仓库根目录（mapper_type='ast'时必需）
     
     Returns:
         LocResult: 定位结果
@@ -179,6 +187,8 @@ def run_bm25_localization(
         top_k_files=top_k_files,
         top_k_modules=top_k_modules,
         top_k_entities=top_k_entities,
+        mapper_type=mapper_type,
+        repos_root=repos_root,
     )
     return method.localize(instance)
 

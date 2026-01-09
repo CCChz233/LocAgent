@@ -379,3 +379,9 @@ def resolve_index_dirs(args, dataset_name: str = None) -> tuple:
     
     return graph_index_dir, bm25_index_dir
 
+# ============================================================================
+# 注意：代码块到实体的映射功能已迁移到 method.mapping 模块
+# - Graph索引+span_ids映射: method.mapping.GraphBasedMapper
+# - AST解析映射: method.mapping.ASTBasedMapper
+# ============================================================================
+

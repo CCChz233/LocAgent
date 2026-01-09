@@ -246,9 +246,14 @@ def auto_search_process(result_queue,
                 ipython_code = action.code.strip('`')
                 logging.info(f"Executing code:\n```\n{ipython_code}\n```")
                 function_response = execute_ipython(ipython_code)
+                if function_response is None:
+                    function_response = ""
                 try:
+                    # 只有当输出看起来像 Python 字面量时才尝试 eval
                     function_response = eval(function_response)
-                except SyntaxError:
+                except (SyntaxError, NameError, ValueError, TypeError) as e:
+                    # 捕获所有可能的 eval 错误，保持原字符串
+                    logging.debug(f"eval failed for function_response, keeping as string: {type(e).__name__}")
                     function_response = function_response
                 if not isinstance(function_response, str):
                     function_response = str(function_response)
@@ -494,10 +499,10 @@ def localize(args):
     else:
         bench_data = load_dataset(args.dataset, split=args.split)
         bench_tests = filter_dataset(bench_data, 'instance_id', args.used_list)
-        if args.eval_n_limit:
-            eval_n_limit = min(args.eval_n_limit, len(bench_tests))
+    if args.eval_n_limit:
+        eval_n_limit = min(args.eval_n_limit, len(bench_tests))
             bench_tests = bench_tests.select(range(0, eval_n_limit))
-            logging.info(f'Limiting evaluation to first {eval_n_limit} instances.')
+        logging.info(f'Limiting evaluation to first {eval_n_limit} instances.')
 
     manager = mp.Manager()
     queue = manager.Queue()

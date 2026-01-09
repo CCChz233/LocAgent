@@ -10,13 +10,18 @@ Outputs: embeddings.pt + metadata.jsonl
 
 import argparse
 import json
+import pickle
+import os
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel
 from tqdm import tqdm
+
+from dependency_graph import RepoEntitySearcher
+from dependency_graph.build_graph import NODE_TYPE_FUNCTION, NODE_TYPE_CLASS
 
 
 class Block:
@@ -180,19 +185,113 @@ def embed_blocks(blocks: List[Block], model: AutoModel, tokenizer: AutoTokenizer
     return torch.cat(outs, dim=0)
 
 
-def save_index(output_dir: Path, embeddings: torch.Tensor, blocks: List[Block], strategy: str):
+def extract_span_ids_from_graph(
+    blocks: List[Block],
+    graph_index_file: str,
+    repo_path: str
+) -> Dict[int, List[str]]:
+    """
+    从Graph索引中为代码块提取span_ids
+    
+    Args:
+        blocks: 代码块列表
+        graph_index_file: Graph索引文件路径（.pkl）
+        repo_path: 仓库根目录（用于路径匹配）
+    
+    Returns:
+        Dict[int, List[str]]: 代码块索引 -> span_ids列表的映射
+    """
+    if not os.path.exists(graph_index_file):
+        print(f"Warning: Graph index file not found: {graph_index_file}")
+        return {}
+    
+    # 加载Graph索引
+    try:
+        with open(graph_index_file, 'rb') as f:
+            graph = pickle.load(f)
+        searcher = RepoEntitySearcher(graph)
+    except Exception as e:
+        print(f"Warning: Failed to load graph index {graph_index_file}: {e}")
+        return {}
+    
+    # 按文件分组代码块
+    blocks_by_file = {}
+    for idx, block in enumerate(blocks):
+        file_path = block.file_path
+        if file_path not in blocks_by_file:
+            blocks_by_file[file_path] = []
+        blocks_by_file[file_path].append((idx, block))
+    
+    # 为每个代码块查找span_ids
+    span_ids_map = {}
+    
+    for file_path, file_blocks in blocks_by_file.items():
+        # 查找该文件的所有节点（函数/类）
+        file_nodes = []
+        for node_id in searcher.G:
+            if node_id.startswith(f"{file_path}:"):
+                file_nodes.append(node_id)
+        
+        # 为每个代码块查找重叠的节点
+        for block_idx, block in file_blocks:
+            span_ids = set()
+            block_start_1based = block.start + 1  # 转换为1-based
+            block_end_1based = block.end + 1
+            
+            for node_id in file_nodes:
+                if not searcher.has_node(node_id):
+                    continue
+                
+                try:
+                    node_data = searcher.get_node_data([node_id], return_code_content=False)[0]
+                    node_start = node_data.get("start_line")
+                    node_end = node_data.get("end_line")
+                    
+                    if node_start is None or node_end is None:
+                        continue
+                    
+                    # 检查行号范围是否重叠
+                    if not (block_end_1based < node_start or block_start_1based > node_end):
+                        node_type = node_data.get("type")
+                        if node_type in [NODE_TYPE_FUNCTION, NODE_TYPE_CLASS]:
+                            # 提取实体名称（node_id格式: file_path:entity_name）
+                            if ":" in node_id:
+                                entity_name = node_id.split(":", 1)[1]
+                                span_ids.add(entity_name)
+                except Exception as e:
+                    # 跳过有问题的节点
+                    continue
+            
+            if span_ids:
+                span_ids_map[block_idx] = list(span_ids)  # 去重并转为列表
+    
+    return span_ids_map
+
+
+def save_index(
+    output_dir: Path,
+    embeddings: torch.Tensor,
+    blocks: List[Block],
+    strategy: str,
+    span_ids_map: Optional[Dict[int, List[str]]] = None
+):
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(embeddings, output_dir / "embeddings.pt")
     with (output_dir / "metadata.jsonl").open("w", encoding="utf-8") as f:
         for idx, b in enumerate(blocks):
-            f.write(json.dumps({
+            metadata = {
                 "block_id": idx,
                 "file_path": b.file_path,
                 "start_line": b.start,
                 "end_line": b.end,
                 "block_type": b.block_type,
                 "strategy": strategy,
-            }) + "\n")
+            }
+            # 如果有span_ids，添加到metadata
+            if span_ids_map and idx in span_ids_map:
+                metadata["span_ids"] = span_ids_map[idx]
+            
+            f.write(json.dumps(metadata) + "\n")
 
 
 def parse_args():
@@ -207,6 +306,12 @@ def parse_args():
     ap.add_argument("--max_length", type=int, default=512, help="Max tokens for encoding.")
     ap.add_argument("--batch_size", type=int, default=8, help="Batch size for encoding.")
     ap.add_argument("--force_cpu", action="store_true", help="Force CPU even if CUDA is available.")
+    ap.add_argument(
+        "--graph_index_file",
+        type=str,
+        default=None,
+        help="Graph索引文件路径（.pkl），如果提供将在metadata中添加span_ids"
+    )
     return ap.parse_args()
 
 
@@ -218,7 +323,15 @@ def main():
 
     blocks = collect_blocks(args.repo_path, args.strategy, args.block_size, args.window_size, args.slice_size)
     embeddings = embed_blocks(blocks, model, tokenizer, args.max_length, args.batch_size, device)
-    save_index(Path(args.output_dir), embeddings, blocks, args.strategy)
+    
+    # 如果提供了Graph索引，提取span_ids
+    span_ids_map = {}
+    if args.graph_index_file:
+        print(f"Extracting span_ids from graph index: {args.graph_index_file}")
+        span_ids_map = extract_span_ids_from_graph(blocks, args.graph_index_file, args.repo_path)
+        print(f"Extracted span_ids for {len(span_ids_map)}/{len(blocks)} blocks")
+    
+    save_index(Path(args.output_dir), embeddings, blocks, args.strategy, span_ids_map)
 
 
 if __name__ == "__main__":

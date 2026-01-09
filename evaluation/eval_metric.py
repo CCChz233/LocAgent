@@ -196,16 +196,18 @@ def cal_metrics_w_file(gt_file, loc_file, key,
                     pred_dict[ins] = pred_modules
     else:
         pred_dict = convert_solutions_dict(load_jsonl(loc_file), key=key)
-        for ins in pred_dict:
-            pred_funcs = pred_dict[ins]
-            pred_modules = []
-            for i, pf in enumerate(pred_funcs):
-                if level == 'function':
+        # 只在 function 级别时进行去重和清理 __init__ 后缀
+        # 对于 file 和 module 级别，保持原始列表不变
+        if level == 'function':
+            for ins in pred_dict:
+                pred_funcs = pred_dict[ins]
+                pred_modules = []
+                for i, pf in enumerate(pred_funcs):
                     if pf.endswith('.__init__'):
                         pf = pf[:(len(pf)-len('.__init__'))]
                     if pf not in pred_modules:
                         pred_modules.append(pf)
-            pred_dict[ins] = pred_modules
+                pred_dict[ins] = pred_modules
         
     _gt_labels = []
     _pred_labels = []

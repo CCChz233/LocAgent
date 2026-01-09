@@ -15,6 +15,7 @@ from plugins.location_tools.retriever.bm25_retriever import (
 )
 from util.benchmark.setup_repo import setup_repo
 from util.utils import append_to_jsonl, load_jsonl
+from method.bm25.retriever import BM25Method
 
 
 def _iter_instances(data, limit: Optional[int]) -> Iterable[dict]:
@@ -111,73 +112,52 @@ def run_instance(
     top_k_files: int,
     top_k_modules: int,
     top_k_entities: int,
+    mapper_type: str = "graph",
+    repos_root: Optional[str] = None,
 ):
-    instance_id = instance["instance_id"]
-    repo_name = _instance_id_to_repo_name(instance_id)
-    graph_index_file = osp.join(graph_index_dir, f"{repo_name}.pkl")
-    retriever_dir = osp.join(bm25_index_dir, repo_name)
-
-    graph = _load_graph(graph_index_file, instance, repo_base_dir, build_if_missing)
-    searcher = RepoEntitySearcher(graph) if graph else None
-
-    retriever = _load_retriever(retriever_dir, instance, repo_base_dir, build_if_missing)
-    if retriever is None:
-        logging.warning("Missing BM25 index for %s. Skipping.", instance_id)
-        return None
-
-    if hasattr(retriever, "similarity_top_k"):
-        retriever.similarity_top_k = max(top_k_files, top_k_modules, top_k_entities)
-
-    query = _problem_text(instance)
-    if not query:
-        logging.warning("No problem statement for %s. Skipping.", instance_id)
-        return None
-
-    found_files: List[str] = []
-    found_modules: List[str] = []
-    found_entities: List[str] = []
-
+    """
+    运行BM25定位实例（使用BM25Method类）
+    
+    Args:
+        instance: 数据集实例
+        graph_index_dir: Graph索引目录
+        bm25_index_dir: BM25索引目录
+        repo_base_dir: 仓库基础目录（用于构建缺失的索引）
+        build_if_missing: 如果索引缺失是否构建
+        top_k_files: 返回的文件数量
+        top_k_modules: 返回的模块数量
+        top_k_entities: 返回的实体数量
+        mapper_type: 映射器类型，'graph' 或 'ast'
+        repos_root: 源代码仓库根目录（mapper_type='ast'时必需）
+    
+    Returns:
+        结果字典或None
+    """
     try:
-        retrieved_nodes = retriever.retrieve(query)
-    except ValueError as e:
-        # Handle case where corpus size is smaller than top_k
-        if "corpus size should be larger than top-k" in str(e):
-            logging.warning("Corpus too small for %s: %s. Skipping.", instance_id, e)
-            return None
-        raise
-    for node in retrieved_nodes:
-        file_path = node.metadata.get("file_path")
-        if file_path:
-            file_path = _clean_file_path(file_path, repo_name)
-            _dedupe_append(found_files, file_path, top_k_files)
-
-        if searcher and file_path:
-            span_ids = node.metadata.get("span_ids", [])
-            for span_id in span_ids:
-                entity_id = f"{file_path}:{span_id}"
-                if not searcher.has_node(entity_id):
-                    continue
-                node_data = searcher.get_node_data([entity_id])[0]
-                if node_data["type"] == NODE_TYPE_FUNCTION:
-                    _dedupe_append(found_entities, entity_id, top_k_entities)
-                    _dedupe_append(found_modules, _module_id(entity_id), top_k_modules)
-                elif node_data["type"] == NODE_TYPE_CLASS:
-                    _dedupe_append(found_modules, entity_id, top_k_modules)
-
-        if (
-            len(found_files) >= top_k_files
-            and len(found_modules) >= top_k_modules
-            and len(found_entities) >= top_k_entities
-        ):
-            break
-
-    return {
-        "instance_id": instance_id,
-        "found_files": found_files,
-        "found_modules": found_modules,
-        "found_entities": found_entities,
-        "raw_output_loc": [],
-    }
+        # 使用BM25Method类进行定位
+        method = BM25Method(
+            graph_index_dir=graph_index_dir,
+            bm25_index_dir=bm25_index_dir,
+            top_k_files=top_k_files,
+            top_k_modules=top_k_modules,
+            top_k_entities=top_k_entities,
+            mapper_type=mapper_type,
+            repos_root=repos_root,
+        )
+        
+        result = method.localize(instance)
+        
+        # 转换为字典格式（兼容原有输出格式）
+        return {
+            "instance_id": result.instance_id,
+            "found_files": result.found_files,
+            "found_modules": result.found_modules,
+            "found_entities": result.found_entities,
+            "raw_output_loc": [],
+        }
+    except Exception as e:
+        logging.warning("Error processing instance %s: %s", instance.get("instance_id"), e)
+        return None
 
 
 def main():
@@ -192,10 +172,23 @@ def main():
     parser.add_argument("--bm25_index_dir", type=str, default="")
     parser.add_argument("--repo_base_dir", type=str, default="playground/bm25_baseline")
     parser.add_argument("--eval_n_limit", type=int, default=0)
-    parser.add_argument("--top_k_files", type=int, default=10)
-    parser.add_argument("--top_k_modules", type=int, default=10)
-    parser.add_argument("--top_k_entities", type=int, default=10)
+    parser.add_argument("--top_k_files", type=int, default=15)
+    parser.add_argument("--top_k_modules", type=int, default=15)
+    parser.add_argument("--top_k_entities", type=int, default=15)
     parser.add_argument("--build_if_missing", action="store_true")
+    parser.add_argument(
+        "--mapper_type",
+        type=str,
+        choices=["graph", "ast"],
+        default="graph",
+        help="映射器类型: 'graph' (Graph索引+span_ids, 默认) 或 'ast' (AST解析)"
+    )
+    parser.add_argument(
+        "--repos_root",
+        type=str,
+        default="",
+        help="源代码仓库根目录（使用 --mapper_type ast 时必需）"
+    )
     args = parser.parse_args()
 
     dataset_name = args.dataset_name or args.dataset.split("/")[-1]
@@ -244,6 +237,8 @@ def main():
             top_k_files=args.top_k_files,
             top_k_modules=args.top_k_modules,
             top_k_entities=args.top_k_entities,
+            mapper_type=args.mapper_type,
+            repos_root=args.repos_root if args.repos_root else None,
         )
         if result:
             append_to_jsonl(result, output_file)
